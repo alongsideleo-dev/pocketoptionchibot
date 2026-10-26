@@ -379,30 +379,34 @@ class TelegramHandler:
             self.logger.info("Initializing Telegram client...")
             self._load_session()
 
-            if not self.session_string and not self.phone_number:
-                self.logger.warning("No saved Telegram session found. Please connect via Settings in the Dashboard.")
+            if not self.session_string:
+                self.logger.warning("No Telegram StringSession available. Authenticate in Settings, or set TELEGRAM_SESSION_STRING on Render.")
                 return False
 
             session = StringSession(self.session_string) if self.session_string else StringSession()
             self.client = TelegramClient(session, self.api_id, self.api_hash)
 
-            if self.session_string:
-                await self.client.connect()
-                if not await self.client.is_user_authorized():
-                    self.logger.warning("Telegram session expired or not authorized. Re-authentication required.")
-                    return False
-            else:
-                await self.client.start(phone=self.phone_number)
+            await self.client.connect()
+            if not await self.client.is_user_authorized():
+                self.logger.warning("Telegram session expired or not authorized. Re-authentication required.")
+                await self.client.disconnect()
+                return False
 
             self.session_string = self.client.session.save()
-            self._save_session()
+            if not (os.getenv("TELEGRAM_SESSION_STRING") or os.getenv("SESSION_STRING")):
+                self._save_session()
 
             self.executor = SignalExecutor(self.config, pocket_handler)
             self.logger.info("Telegram client initialized successfully.")
             return True
 
         except Exception as e:
-            self.logger.error(f"Failed to initialize Telegram client: {e}", exc_info=True)
+            self.logger.error("Failed to initialize Telegram client: %s", type(e).__name__, exc_info=True)
+            if self.client:
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
             return False
 
     async def test_connection(self) -> bool:
@@ -480,7 +484,11 @@ class TelegramHandler:
                     'phone_number':   self.phone_number,
                     'saved_at':       datetime.now().isoformat(),
                 }, f)
-            self.logger.info("Telegram session saved.")
+            try:
+                os.chmod(session_file, 0o600)
+            except OSError:
+                pass
+            self.logger.info("Telegram session saved locally (ephemeral on Render Free).")
         except Exception as e:
             self.logger.error(f"Could not save session: {e}")
 

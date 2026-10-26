@@ -24,6 +24,7 @@ SocketIO Events (outgoing):
 """
 
 import asyncio
+import re
 import json
 import logging
 import os
@@ -47,7 +48,7 @@ app = Flask(
     template_folder=str(_ASSETS_DIR / "templates"),
     static_folder=str(_ASSETS_DIR / "static"),
 )
-app.config["SECRET_KEY"] = "pocket-option-bot-2026"
+app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY") or os.urandom(32).hex()
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 # ─── Shared async runtime ────────────────────────────────────
@@ -225,13 +226,70 @@ def get_bot_state() -> dict:
 
 
 def get_connection_status() -> dict:
-    """Return live connection status — reads directly from active session."""
-    config = _read_json(CONFIG_FILE)
-    session_name = (config.get("telegram", {}).get("session_name") or "pocket_bot_session")
-    session_data = _read_json(BASE_DIR / f"{session_name}.json")
-    telegram_ok  = bool(session_data.get("session_string"))
+    """Only report connected when a live Telegram client is authorized.
 
+    A saved StringSession is a credential, not proof of a current connection.
+    """
+    handler = getattr(_bot_instance, "telegram_handler", None) if _bot_instance else None
+    client = getattr(handler, "client", None)
+    telegram_ok = False
+    if client is not None and client.is_connected():
+        try:
+            telegram_ok = bool(run_sync(client.is_user_authorized(), timeout=5))
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Telegram status check failed: %s", type(exc).__name__)
     return {"telegram": telegram_ok, "pocket_option": _pocket_is_connected()}
+
+
+def _telegram_session_file() -> Path:
+    config = _read_json(CONFIG_FILE, {}) or {}
+    name = config.get("telegram", {}).get("session_name") or "pocket_bot_session"
+    return BASE_DIR / f"{name}.json"
+
+
+def _save_telegram_session(client, phone):
+    """Save locally for this instance; Render Free local storage is ephemeral."""
+    session_string = client.session.save()
+    target = _telegram_session_file()
+    target.write_text(json.dumps({
+        "session_string": session_string,
+        "phone_number": phone,
+        "saved_at": datetime.now().isoformat(),
+    }, indent=2), encoding="utf-8")
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
+    logging.getLogger(__name__).info(
+        "Telegram authorized and session saved locally. On Render Free, "
+        "configure TELEGRAM_SESSION_STRING securely for persistence across restarts."
+    )
+
+
+def _telegram_auth_error(exc):
+    """Avoid returning secret-bearing raw exception strings to the browser."""
+    name = type(exc).__name__
+    guidance = {
+        "PhoneNumberInvalidError": "Phone number is invalid. Use international format such as +14035550123.",
+        "ApiIdInvalidError": "Telegram API ID or API hash is invalid.",
+        "PhoneCodeInvalidError": "Incorrect Telegram login code.",
+        "PhoneCodeExpiredError": "Telegram login code expired. Request a new one.",
+        "PhoneCodeEmptyError": "Enter the Telegram login code.",
+        "FloodWaitError": "Telegram rate-limited login attempts. Wait before retrying.",
+        "PasswordHashInvalidError": "Incorrect Telegram two-step verification password.",
+        "PhoneNumberBannedError": "Telegram has restricted this phone number.",
+    }
+    return guidance.get(name, f"Telegram authentication failed ({name}). Check Render logs.")
+
+
+async def _close_pending_telegram_client():
+    previous = _tg_client_store.pop("client", None)
+    _tg_client_store.clear()
+    if previous is not None:
+        try:
+            await previous.disconnect()
+        except Exception:
+            pass
 
 
 # ─── Routes ──────────────────────────────────────────────────
@@ -385,131 +443,129 @@ def bot_stop():
 
 @app.route("/api/telegram/connect", methods=["POST"])
 def telegram_connect():
-    data = request.get_json(force=True)
-    phone = (data.get("phone") or "").strip()
-    if not phone:
-        return jsonify({"success": False, "message": "Phone number required"}), 400
+    data = request.get_json(silent=True) or {}
+    phone = re.sub(r"[\s()\-]", "", str(data.get("phone") or ""))
+    if not re.fullmatch(r"\+[1-9]\d{7,14}", phone):
+        return jsonify({"success": False, "message": "Enter the number in international format, e.g. +14035550123."}), 400
 
-    config = _read_json(CONFIG_FILE)
-    api_id   = config.get("telegram", {}).get("api_id")
+    config = _read_json(CONFIG_FILE, {}) or {}
+    api_id = config.get("telegram", {}).get("api_id")
     api_hash = config.get("telegram", {}).get("api_hash", "")
-
     if not api_id or not api_hash:
         return jsonify({"success": False, "message": "Save Telegram API ID and Hash in Settings first."}), 400
-
-    result = {"success": False, "message": ""}
 
     async def _send():
         from telethon import TelegramClient
         from telethon.sessions import StringSession
+        await _close_pending_telegram_client()
         client = TelegramClient(StringSession(), int(api_id), str(api_hash))
-        await client.connect()
-        _tg_client_store["client"] = client
-        _tg_client_store["phone"]  = phone
-        res = await client.send_code_request(phone)
-        _tg_client_store["phone_code_hash"] = res.phone_code_hash
-        result["success"] = True
+        try:
+            await client.connect()
+            sent = await client.send_code_request(phone)
+            _tg_client_store.update(client=client, phone=phone, phone_code_hash=sent.phone_code_hash)
+            delivery = type(getattr(sent, "type", None)).__name__
+            logging.getLogger(__name__).info("Telegram accepted code request; delivery method: %s", delivery)
+            return delivery
+        except Exception:
+            await client.disconnect()
+            raise
 
     try:
-        run_sync(_send(), timeout=20)
-    except Exception as e:
-        result["message"] = str(e)
-        _tg_client_store.clear()
-
-    return jsonify(result)
+        delivery = run_sync(_send(), timeout=45)
+        return jsonify({
+            "success": True,
+            "message": "Telegram accepted the request. Check the official Telegram chat on your signed-in devices; delivery is not guaranteed.",
+            "delivery_type": delivery,
+        })
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Telegram send-code failed: %s", type(exc).__name__)
+        return jsonify({"success": False, "message": _telegram_auth_error(exc)}), 400
 
 
 @app.route("/api/telegram/verify", methods=["POST"])
 def telegram_verify():
-    data = request.get_json(force=True)
-    code = (data.get("code") or "").strip()
+    data = request.get_json(silent=True) or {}
+    code = re.sub(r"\s", "", str(data.get("code") or ""))
     client = _tg_client_store.get("client")
-    phone  = _tg_client_store.get("phone")
+    phone = _tg_client_store.get("phone")
     phone_code_hash = _tg_client_store.get("phone_code_hash")
-
-    if not client or not phone:
-        return jsonify({"success": False, "message": "Session expired - request code again"}), 400
-
-    result = {"success": False, "message": "", "two_factor_required": False}
+    if not client or not phone or not phone_code_hash:
+        return jsonify({"success": False, "message": "Login attempt expired. Request a new code."}), 400
+    if not code.isdigit():
+        return jsonify({"success": False, "message": "Enter the numeric code from Telegram."}), 400
 
     async def _verify():
         from telethon.errors import SessionPasswordNeededError
         try:
             await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
-            session_str = client.session.save()
-            config = _read_json(CONFIG_FILE)
-            session_name = config.get("telegram", {}).get("session_name", "pocket_bot_session")
-            (BASE_DIR / f"{session_name}.json").write_text(json.dumps({
-                "session_string": session_str,
-                "phone_number":   phone,
-                "saved_at":       datetime.now().isoformat(),
-            }, indent=2), encoding="utf-8")
-            result["success"] = True
-            await client.disconnect()
-            _tg_client_store.clear()
+            if not await client.is_user_authorized():
+                return {"success": False, "message": "Telegram did not authorize this session."}
+            _save_telegram_session(client, phone)
+            await _close_pending_telegram_client()
+            return {"success": True, "message": "Telegram authorized. Start the bot to establish its live connection."}
         except SessionPasswordNeededError:
-            result["two_factor_required"] = True
-        except Exception as e:
-            result["message"] = str(e)
+            return {"success": False, "two_factor_required": True, "message": "Enter your Telegram two-step verification password."}
 
     try:
-        run_sync(_verify(), timeout=20)
-    except Exception as e:
-        result["message"] = str(e)
-
+        result = run_sync(_verify(), timeout=45)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Telegram verify failed: %s", type(exc).__name__)
+        result = {"success": False, "message": _telegram_auth_error(exc)}
     if result.get("success"):
-        socketio.emit("connection_update", {"telegram": True})
-    return jsonify(result)
+        socketio.emit("connection_update", get_connection_status())
+    return jsonify(result), (200 if result.get("success") or result.get("two_factor_required") else 400)
 
 
 @app.route("/api/telegram/password", methods=["POST"])
 def telegram_password():
-    data     = request.get_json(force=True)
-    password = data.get("password") or ""
-    client   = _tg_client_store.get("client")
-    phone    = _tg_client_store.get("phone")
-
+    data = request.get_json(silent=True) or {}
+    password = str(data.get("password") or "")
+    client = _tg_client_store.get("client")
+    phone = _tg_client_store.get("phone")
     if not client:
-        return jsonify({"success": False, "message": "Session expired - start over"}), 400
-
-    result = {"success": False, "message": ""}
+        return jsonify({"success": False, "message": "Login attempt expired. Start again."}), 400
+    if not password:
+        return jsonify({"success": False, "message": "Enter the Telegram two-step verification password."}), 400
 
     async def _pw():
-        try:
-            await client.sign_in(password=password)
-            session_str = client.session.save()
-            config = _read_json(CONFIG_FILE)
-            session_name = config.get("telegram", {}).get("session_name", "pocket_bot_session")
-            (BASE_DIR / f"{session_name}.json").write_text(json.dumps({
-                "session_string": session_str,
-                "phone_number":   phone,
-                "saved_at":       datetime.now().isoformat(),
-            }, indent=2), encoding="utf-8")
-            result["success"] = True
-            await client.disconnect()
-            _tg_client_store.clear()
-        except Exception as e:
-            result["message"] = str(e)
+        await client.sign_in(password=password)
+        if not await client.is_user_authorized():
+            raise RuntimeError("Telegram session not authorized")
+        _save_telegram_session(client, phone)
+        await _close_pending_telegram_client()
 
     try:
-        run_sync(_pw(), timeout=20)
-    except Exception as e:
-        result["message"] = str(e)
-
-    if result.get("success"):
-        socketio.emit("connection_update", {"telegram": True})
-    return jsonify(result)
+        run_sync(_pw(), timeout=45)
+        socketio.emit("connection_update", get_connection_status())
+        return jsonify({"success": True, "message": "Telegram authorized. Start the bot to connect."})
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Telegram password step failed: %s", type(exc).__name__)
+        return jsonify({"success": False, "message": _telegram_auth_error(exc)}), 400
 
 
 @app.route("/api/telegram/disconnect", methods=["POST"])
 def telegram_disconnect():
-    config       = _read_json(CONFIG_FILE)
-    session_name = config.get("telegram", {}).get("session_name", "pocket_bot_session")
-    session_file = BASE_DIR / f"{session_name}.json"
+    try:
+        run_sync(_close_pending_telegram_client(), timeout=10)
+    except Exception:
+        pass
+    session_file = _telegram_session_file()
     if session_file.exists():
         session_file.unlink()
-    socketio.emit("connection_update", {"telegram": False})
-    return jsonify({"success": True})
+    # An environment session cannot be removed from inside the app.
+    # Do not falsely report disconnection while the bot is still connected.
+    handler = getattr(_bot_instance, "telegram_handler", None) if _bot_instance else None
+    if handler is not None:
+        try:
+            run_sync(handler.disconnect(), timeout=10)
+        except Exception:
+            pass
+    env_active = bool(os.getenv("TELEGRAM_SESSION_STRING") or os.getenv("SESSION_STRING"))
+    socketio.emit("connection_update", get_connection_status())
+    return jsonify({"success": True, "message": (
+        "Local session cleared. Remove TELEGRAM_SESSION_STRING from Render to prevent reconnection."
+        if env_active else "Local Telegram session cleared."
+    )})
 
 
 # ─── Pocket Option Connection ────────────────────────────────
