@@ -386,11 +386,14 @@ class PocketHandler:
         dir_enum = OrderDirection.CALL if direction.lower() == 'call' else OrderDirection.PUT
         start_time = time.time()
 
-        # Clear any prior rejection error for this asset
-        self._last_order_errors.pop(str(asset_name), None)
-        self._last_order_errors.pop(str(asset_name).lower(), None)
-
-        try:
+        # Retry ONLY when the broker explicitly rejects an expiry. Never retry
+        # an ambiguous timeout or transport error: an order may have succeeded.
+        # A brief delay moves us away from a five-minute expiry boundary.
+        max_expiry_retries = 2
+        order = None
+        for attempt in range(max_expiry_retries + 1):
+            self._last_order_errors.pop(str(asset_name), None)
+            self._last_order_errors.pop(str(asset_name).lower(), None)
             place_task = asyncio.create_task(
                 self.client.place_order(
                     asset=asset_name,
@@ -399,32 +402,76 @@ class PocketHandler:
                     duration=period_secs,
                 )
             )
+            explicit_rejection = None
+            try:
+                deadline = time.monotonic() + 25.0
+                while time.monotonic() < deadline:
+                    # Prefer a confirmed successful response over an unrelated
+                    # broker notice for the same asset.
+                    if place_task.done():
+                        order = place_task.result()
+                        break
+                    err = (self._last_order_errors.get(str(asset_name))
+                           or self._last_order_errors.get(str(asset_name).lower()))
+                    if err:
+                        explicit_rejection = str(err)
+                        break
+                    await asyncio.sleep(0.2)
 
-            order = None
-            max_wait = 25.0
-            elapsed = 0.0
-            while elapsed < max_wait:
-                if place_task.done():
-                    order = place_task.result()
-                    break
-
-                err = self._last_order_errors.get(str(asset_name)) or self._last_order_errors.get(str(asset_name).lower())
-                if err:
-                    self.logger.error(f"Trade rejected by Pocket Option for {asset_name}: {err}")
+                if explicit_rejection:
                     place_task.cancel()
+                    try:
+                        await place_task
+                    except asyncio.CancelledError:
+                        pass
+                    # If cancellation raced with a successful response, avoid
+                    # placing a duplicate order.
+                    if place_task.done() and not place_task.cancelled():
+                        possible_order = place_task.result()
+                        if possible_order:
+                            order = possible_order
+                            break
+                    self.logger.warning(
+                        'Broker explicitly rejected %s (%s), attempt %d/%d',
+                        asset_name, explicit_rejection, attempt + 1,
+                        max_expiry_retries + 1,
+                    )
+                    if (explicit_rejection.strip().lower() == 'incorrectexptime'
+                            and attempt < max_expiry_retries):
+                        delay = 1.5 * (attempt + 1)
+                        self.logger.info(
+                            'Retrying %s after %.1fs with unchanged stake $%.2f '
+                            'and expiry %ds (no Martingale step advance).',
+                            step_label, delay, amount, period_secs,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    self.logger.error(
+                        'Trade rejected by Pocket Option for %s: %s',
+                        asset_name, explicit_rejection,
+                    )
                     return False, None
 
-                await asyncio.sleep(0.2)
-                elapsed += 0.2
-
-            if not place_task.done():
-                place_task.cancel()
-                self.logger.error(f"Order placement timed out for {asset_name} within {max_wait:.0f}s.")
+                if not place_task.done():
+                    place_task.cancel()
+                    try:
+                        await place_task
+                    except asyncio.CancelledError:
+                        pass
+                    self.logger.error(
+                        'Order placement timed out for %s; not retrying '
+                        'because order status is uncertain.', asset_name,
+                    )
+                    return False, None
+                break
+            except Exception as e:
+                if not place_task.done():
+                    place_task.cancel()
+                self.logger.error(
+                    'Error placing order for %s: %s (no retry; status uncertain)',
+                    asset_name, e,
+                )
                 return False, None
-
-        except Exception as e:
-            self.logger.error(f"Error placing order for {asset_name}: {e}")
-            return False, None
 
         if not order:
             self.logger.error(f"Trade rejected by Pocket Option for {asset_name}.")
