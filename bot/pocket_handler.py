@@ -45,7 +45,7 @@ class PocketHandler:
         self.assets_info: dict = {}
         self._last_order_errors: dict = {}
 
-        # Martingale progression that PERSISTS across signals/cycles:
+        # Legacy Martingale state (not used to carry losses between signals):
         self._mg_amount: Optional[float] = None   # carried amount for next cycle's first trade
         self._mg_losses: int = 0                  # consecutive losses in current progression
         self.driver = None  # kept for interface compatibility with SignalExecutor
@@ -215,10 +215,8 @@ class PocketHandler:
 
     async def pre_configure_trade(self, expiry: Optional[str] = None) -> float:
         """Called immediately after asset selection for timed signals."""
-        if self.config.trading.martingale_enabled and self._mg_amount:
-            amount = self._mg_amount
-        else:
-            amount = await self._calc_amount()
+        # Each signal begins with the dashboard-configured base amount.
+        amount = await self._calc_amount()
         self.logger.info(
             f"Pre-configured: ${amount:.2f} | expiry: {expiry or '00:01:00'} - ready, waiting for entry time."
         )
@@ -534,9 +532,9 @@ class PocketHandler:
             )
             period_secs = self._expiry_to_seconds(expiry or "00:01:00")
 
-            # ── Check if martingale should run (from config OR signal) ──
-            has_signal_mg = (signal_martingale_steps is not None and signal_martingale_steps > 0)
-            use_martingale = self.config.trading.martingale_enabled or has_signal_mg
+            # Dashboard settings are authoritative. Telegram's optional Martingale
+            # levels and schedule must not override the configured trade count.
+            use_martingale = bool(self.config.trading.martingale_enabled)
             if not use_martingale:
                 placed, _ = await self._place_one(
                     asset_name, direction, period_secs, base_amount, expiry,
@@ -544,12 +542,18 @@ class PocketHandler:
                 )
                 return placed
 
-            # ── Auto-Martingale: sequence confined to THIS pair & signal ──
-            # Determine recovery steps from signal or configuration
-            if signal_martingale_steps is not None and signal_martingale_steps > 0:
-                recovery_steps = signal_martingale_steps
-            else:
-                recovery_steps = max(0, int(self.config.trading.martingale_steps))
+            # Dashboard label: "Steps (Trades per Signal, Same Pair)".
+            # Count includes the base trade: 15 = 1 base + 14 recoveries.
+            total_trades = max(1, int(self.config.trading.martingale_steps))
+            recovery_steps = total_trades - 1
+            # Telegram-provided recovery times are intentionally ignored;
+            # subsequent trades run after each preceding trade settles.
+            martingale_times = None
+            self.logger.info(
+                "Martingale settings from dashboard: %d total trades "
+                "(1 base + %d recoveries); Telegram recovery levels ignored.",
+                total_trades, recovery_steps,
+            )
 
             mult = float(self.config.trading.martingale_multiplier)
 
