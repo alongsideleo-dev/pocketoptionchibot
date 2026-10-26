@@ -39,7 +39,25 @@ from flask import Flask, jsonify, render_template, request, send_file
 from flask_socketio import SocketIO, emit
 
 BASE_DIR    = Path(__file__).parent.parent          # Project root
-CONFIG_FILE = BASE_DIR / "config.json"
+DATA_DIR = Path(os.environ.get("BOT_DATA_DIR", str(BASE_DIR))).resolve()
+CONFIG_FILE = DATA_DIR / "config.json"
+
+def _initialize_persistent_config():
+    """Seed an empty persistent disk once, never overwrite saved dashboard changes."""
+    if DATA_DIR == BASE_DIR:
+        return
+    if not DATA_DIR.is_dir():
+        raise RuntimeError(f"BOT_DATA_DIR does not exist: {DATA_DIR}. Mount the Render disk first.")
+    if not CONFIG_FILE.exists():
+        source = BASE_DIR / "config.json"
+        if source.is_file():
+            import shutil
+            shutil.copy2(source, CONFIG_FILE)
+        else:
+            CONFIG_FILE.write_text("{}\n", encoding="utf-8")
+    os.chmod(CONFIG_FILE, 0o600)
+
+_initialize_persistent_config()
 _ASSETS_DIR = BASE_DIR / "dashboard"                # HTML/CSS/JS live here
 sys.path.insert(0, str(BASE_DIR))
 
@@ -120,7 +138,14 @@ def _read_json(path: Path, default=None):
 
 def _write_json(path: Path, data: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
+        temp_path = Path(f.name)
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(temp_path, 0o600)
+    os.replace(temp_path, path)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -244,7 +269,7 @@ def get_connection_status() -> dict:
 def _telegram_session_file() -> Path:
     config = _read_json(CONFIG_FILE, {}) or {}
     name = config.get("telegram", {}).get("session_name") or "pocket_bot_session"
-    return BASE_DIR / f"{name}.json"
+    return DATA_DIR / f"{name}.json"
 
 
 def _save_telegram_session(client, phone):

@@ -460,10 +460,10 @@ class TelegramHandler:
                 return
 
             session_file_name = f"{self.config.telegram.session_name}.json"
-            candidates = [
-                Path(session_file_name),
-                Path(__file__).resolve().parent.parent / session_file_name,
-            ]
+            data_dir = Path(os.environ.get("BOT_DATA_DIR", str(Path(__file__).resolve().parent.parent))).resolve()
+            candidates = [data_dir / session_file_name]
+            if not os.environ.get("BOT_DATA_DIR"):
+                candidates.extend([Path(session_file_name), Path(__file__).resolve().parent.parent / session_file_name])
             for p in candidates:
                 if p.exists():
                     with open(p, 'r', encoding='utf-8') as f:
@@ -477,7 +477,9 @@ class TelegramHandler:
 
     def _save_session(self):
         try:
-            session_file = Path(__file__).resolve().parent.parent / f"{self.config.telegram.session_name}.json"
+            data_dir = Path(os.environ.get("BOT_DATA_DIR", str(Path(__file__).resolve().parent.parent))).resolve()
+            session_file = data_dir / f"{self.config.telegram.session_name}.json"
+            session_file.parent.mkdir(parents=True, exist_ok=True)
             with open(session_file, 'w', encoding='utf-8') as f:
                 json.dump({
                     'session_string': self.session_string,
@@ -488,7 +490,7 @@ class TelegramHandler:
                 os.chmod(session_file, 0o600)
             except OSError:
                 pass
-            self.logger.info("Telegram session saved locally (ephemeral on Render Free).")
+            self.logger.info("Telegram session saved to configured storage directory.")
         except Exception as e:
             self.logger.error(f"Could not save session: {e}")
 

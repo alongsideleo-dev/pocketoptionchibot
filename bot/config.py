@@ -61,17 +61,20 @@ class LoggingConfig:
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG_FILE = BASE_DIR / "config.json"
+DATA_DIR = Path(os.environ.get("BOT_DATA_DIR", str(BASE_DIR))).resolve()
+DEFAULT_CONFIG_FILE = DATA_DIR / "config.json"
 
 
 class Config:
     """Main configuration class"""
 
     def __init__(self, config_file: Optional[str] = None):
-        if config_file:
-            self.config_file = str(Path(config_file).resolve())
-        else:
-            self.config_file = str(DEFAULT_CONFIG_FILE)
+        requested = Path(config_file).resolve() if config_file else DEFAULT_CONFIG_FILE
+        # Existing main.py may pass the repository's config.json explicitly.
+        # Redirect that path to the persistent disk without changing main.py.
+        if DATA_DIR != BASE_DIR and requested == (BASE_DIR / "config.json"):
+            requested = DEFAULT_CONFIG_FILE
+        self.config_file = str(requested)
         self.logger = logging.getLogger(__name__)
         self._load_config()
 
@@ -218,8 +221,16 @@ class Config:
                 },
                 'logging': self.logging.__dict__,
             }
-            with open(self.config_file, 'w', encoding='utf-8') as f:
+            import tempfile
+            target = Path(self.config_file)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, delete=False) as f:
+                temporary = Path(f.name)
                 json.dump(config_data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, target)
             self.logger.info(f"Configuration saved to {self.config_file}")
         except Exception as e:
             self.logger.error(f"Error saving configuration: {e}")
