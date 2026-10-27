@@ -35,6 +35,8 @@ class PocketHandler:
         self.losses = 0                # settled losing trades today
         self.daily_pnl = 0.0           # realized profit/loss today
         self.active_trades = 0
+        self._sequence_lock = asyncio.Lock()  # one reservation per entire signal/recovery sequence
+        self._connection_lock = asyncio.Lock()  # serialize dashboard and health-monitor connections
         self._trade_date = None
         self._day_start_balance: Optional[float] = None   # balance snapshot at 00:00
         self.balance: Optional[float] = None              # last known account balance (dashboard)
@@ -55,55 +57,66 @@ class PocketHandler:
     # =========================================================================
 
     async def connect(self, **kwargs) -> bool:
-        """Connects to Pocket Option WebSocket API using SSID."""
-        if AsyncPocketOptionClient is None:
-            self.logger.error("pocketoptionapi_async is not installed.")
-            return False
-
-        ssid = os.getenv("POCKET_OPTION_SSID") or self.config.pocket_option.ssid
-        if not ssid:
-            self.logger.error(
-                "Pocket Option SSID missing. "
-                "Enter it in Settings -> Pocket Option Account, or set POCKET_OPTION_SSID env var."
-            )
-            return False
-
-        is_demo = (self.config.trading.account_type.lower() == "demo") or self.config.pocket_option.is_demo
-
-        try:
-            self.logger.info(f"Connecting to Pocket Option (demo={is_demo})...")
-            self.client = AsyncPocketOptionClient(ssid=ssid, is_demo=is_demo)
-            if hasattr(self.client, '_websocket'):
-                self.client._websocket.add_event_handler("json_data", self._on_raw_json_data)
-            await self.client.connect()
-
-            # Wait briefly to confirm handshake settled
-            for _ in range(10):
-                if getattr(self.client, 'is_connected', False):
-                    break
-                await asyncio.sleep(0.5)
-
-            if not getattr(self.client, 'is_connected', False):
-                self.logger.error("Pocket Option WebSocket connection failed (check SSID validity).")
-                self.is_connected = False
+        """Serialize connection attempts and verify the broker client state."""
+        async with self._connection_lock:
+            if self._driver_alive():
+                self.logger.info("Pocket Option connection already active; reusing it.")
+                return True
+            if AsyncPocketOptionClient is None:
+                self.logger.error("pocketoptionapi_async is not installed.")
                 return False
-
-            self.is_connected = True
-            self.logger.info("Successfully connected to Pocket Option.")
-
-            try:
-                balance = await self.get_balance()
-                self.logger.info(f"Connected. Balance: ${balance:.2f}")
-            except Exception as e:
-                self.logger.warning(f"Could not read balance immediately: {e}")
-
-            await self._refresh_balance_stats()
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Error connecting to Pocket Option: {e}", exc_info=True)
+            ssid = os.getenv("POCKET_OPTION_SSID") or self.config.pocket_option.ssid
+            if not ssid or not str(ssid).strip():
+                self.logger.error("Pocket Option SSID missing in dashboard settings.")
+                return False
+            is_demo = (self.config.trading.account_type.lower() == "demo") or self.config.pocket_option.is_demo
+            old_client = self.client
             self.is_connected = False
-            return False
+            self.client = None
+            if old_client is not None:
+                try:
+                    await asyncio.wait_for(old_client.disconnect(), timeout=8.0)
+                except Exception as exc:
+                    self.logger.warning("Previous Pocket Option client cleanup: %s", type(exc).__name__)
+            client = None
+            try:
+                self.logger.info("Connecting to Pocket Option (demo=%s)...", is_demo)
+                client = AsyncPocketOptionClient(ssid=ssid, is_demo=is_demo)
+                if hasattr(client, "_websocket"):
+                    client._websocket.add_event_handler("json_data", self._on_raw_json_data)
+                await asyncio.wait_for(client.connect(), timeout=25.0)
+                for _ in range(10):
+                    if getattr(client, "is_connected", False):
+                        break
+                    await asyncio.sleep(0.5)
+                if not getattr(client, "is_connected", False):
+                    self.logger.error("WebSocket connect returned without connected state (library or authentication issue).")
+                    return False
+                self.client = client
+                self.is_connected = True
+                self.logger.info("Successfully connected to Pocket Option.")
+                try:
+                    balance = await asyncio.wait_for(self.get_balance(), timeout=10.0)
+                    self.logger.info("Connected. Balance: $%.2f", balance)
+                    await asyncio.wait_for(self._refresh_balance_stats(), timeout=12.0)
+                except Exception as exc:
+                    self.logger.warning("Connected, but balance refresh failed: %s", type(exc).__name__)
+                return True
+            except asyncio.TimeoutError:
+                self.logger.error("Pocket Option connect timed out after 25 seconds; check library version and network.")
+                return False
+            except Exception as exc:
+                # Avoid logging exception messages that could contain SSIDs.
+                self.logger.error("Pocket Option connect failed: %s", type(exc).__name__)
+                return False
+            finally:
+                if not self.is_connected:
+                    self.client = None
+                    if client is not None:
+                        try:
+                            await asyncio.wait_for(client.disconnect(), timeout=8.0)
+                        except Exception:
+                            pass
 
     def _has_credentials(self) -> bool:
         """Return True if SSID is available."""
@@ -115,14 +128,17 @@ class PocketHandler:
         return self.is_connected and self.client is not None and getattr(self.client, 'is_connected', False)
 
     async def disconnect(self):
-        """Disconnects from the Pocket Option API."""
-        if self.client:
-            try:
-                await self.client.disconnect()
-            except Exception:
-                pass
-        self.is_connected = False
-        self.logger.info("Pocket Option disconnected.")
+        """Disconnect without racing an in-progress connection attempt."""
+        async with self._connection_lock:
+            client = self.client
+            self.client = None
+            self.is_connected = False
+            if client is not None:
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=8.0)
+                except Exception as exc:
+                    self.logger.warning("Pocket Option disconnect issue: %s", type(exc).__name__)
+            self.logger.info("Pocket Option disconnected.")
 
     async def get_balance(self) -> float:
         """Fetch current account balance as a float."""
@@ -555,23 +571,29 @@ class PocketHandler:
             )
             return False
 
-        if self.active_trades >= self.config.trading.max_concurrent_trades:
-            self.logger.warning(
-                f"Max concurrent trades reached ({self.config.trading.max_concurrent_trades}). Skipping."
-            )
-            return False
+        # Reserve a slot for the *entire sequence*, not for each individual order.
+        # The lock prevents simultaneous signals from exceeding the dashboard limit.
+        async with self._sequence_lock:
+            limit = max(1, int(self.config.trading.max_concurrent_trades))
+            if self.active_trades >= limit:
+                self.logger.warning(
+                    "Signal skipped: max concurrent sequences reached (%d/%d).",
+                    self.active_trades, limit,
+                )
+                return False
+            self.active_trades += 1
+            self.logger.info("Trading sequence reserved: %d/%d active.", self.active_trades, limit)
 
         asset_name = self._format_asset(symbol)
-        self.active_trades += 1
-
-        if self.last_trade_time is not None:
-            elapsed = (datetime.now() - self.last_trade_time).total_seconds()
-            cooldown = self.config.pocket_option.wait_between_trades - elapsed
-            if cooldown > 0:
-                self.logger.info(f"Cooldown: waiting {cooldown:.1f}s...")
-                await asyncio.sleep(cooldown)
-
         try:
+            # A global cooldown would delay unrelated signals when concurrency > 1.
+            # Keep the configured cooldown only in single-sequence mode.
+            if limit == 1 and self.last_trade_time is not None:
+                elapsed = (datetime.now() - self.last_trade_time).total_seconds()
+                cooldown = self.config.pocket_option.wait_between_trades - elapsed
+                if cooldown > 0:
+                    self.logger.info("Cooldown: waiting %.1fs...", cooldown)
+                    await asyncio.sleep(cooldown)
             base_amount = (
                 pre_configured_amount
                 if pre_configured_amount is not None
@@ -585,7 +607,7 @@ class PocketHandler:
             if not use_martingale:
                 placed, _ = await self._place_one(
                     asset_name, direction, period_secs, base_amount, expiry,
-                    wait_result=False, step_label="Base Trade",
+                    wait_result=True, step_label="Base Trade",
                 )
                 return placed
 
@@ -702,4 +724,8 @@ class PocketHandler:
             return True
 
         finally:
-            self.active_trades = max(0, self.active_trades - 1)
+            async with self._sequence_lock:
+                self.active_trades = max(0, self.active_trades - 1)
+                self.logger.info("Trading sequence released: %d/%d active.",
+                                 self.active_trades,
+                                 max(1, int(self.config.trading.max_concurrent_trades)))

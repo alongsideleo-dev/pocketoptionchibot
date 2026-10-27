@@ -120,6 +120,7 @@ _bot_stopping: bool = False
 
 # The Pocket Option session opened on startup or from Settings. Kept ALIVE and handed to the bot.
 _shared_pocket = None
+_pocket_connect_lock = None  # created on the shared asyncio loop
 
 # Fallback store when bot is not running
 _server_state: dict = {"alert": None, "pocket_option_connected": False, "balance": None}
@@ -614,31 +615,35 @@ def pocket_option_connect():
     global _shared_pocket
 
     async def _connect():
-        global _shared_pocket
+        global _shared_pocket, _pocket_connect_lock
         from bot.config import Config
         from bot.pocket_handler import PocketHandler
-
-        if _shared_pocket is not None:
-            try:
-                await _shared_pocket.disconnect()
-            except Exception:
-                pass
-            _shared_pocket = None
-
-        config = Config(str(CONFIG_FILE))
-        handler = PocketHandler(config)
-        ok = await handler.connect()
-        if ok:
-            _shared_pocket = handler
-            bal = await handler.get_balance()
-            _patch_state({"pocket_option_connected": True, "alert": None, "balance": bal})
-            socketio.emit("connection_update", {"pocket_option": True})
-            return True, bal, ""
-        _patch_state({"pocket_option_connected": False})
-        return False, None, "Connection failed. Please check that your SSID is fresh and valid."
+        if _pocket_connect_lock is None:
+            _pocket_connect_lock = asyncio.Lock()
+        async with _pocket_connect_lock:
+            # Never disconnect a live session owned by the running bot.
+            if _bot_instance is not None and _bot_instance.running:
+                return False, None, "Stop the bot before changing the Pocket Option connection."
+            if _shared_pocket is not None:
+                try:
+                    await _shared_pocket.disconnect()
+                except Exception:
+                    pass
+                _shared_pocket = None
+            config = Config(str(CONFIG_FILE))
+            handler = PocketHandler(config)
+            ok = await handler.connect()
+            if ok:
+                _shared_pocket = handler
+                bal = await handler.get_balance()
+                _patch_state({"pocket_option_connected": True, "alert": None, "balance": bal})
+                socketio.emit("connection_update", {"pocket_option": True})
+                return True, bal, ""
+            _patch_state({"pocket_option_connected": False})
+            return False, None, "WebSocket connection failed; inspect Render logs for the error type."
 
     try:
-        ok, bal, msg = run_sync(_connect(), timeout=30)
+        ok, bal, msg = run_sync(_connect(), timeout=48)
         if ok:
             return jsonify({"success": True, "balance": bal})
         return jsonify({"success": False, "message": msg})
@@ -737,16 +742,22 @@ def _auto_connect_pocket():
     ssid = cfg.get("pocket_option", {}).get("ssid") or os.getenv("POCKET_OPTION_SSID")
     if ssid and ssid.strip():
         async def _do():
-            global _shared_pocket
-            from bot.config import Config
-            from bot.pocket_handler import PocketHandler
-            config = Config(str(CONFIG_FILE))
-            handler = PocketHandler(config)
-            if await handler.connect():
-                _shared_pocket = handler
-                bal = await handler.get_balance()
-                _patch_state({"pocket_option_connected": True, "balance": bal})
-                socketio.emit("connection_update", {"pocket_option": True})
+            global _shared_pocket, _pocket_connect_lock
+            if _pocket_connect_lock is None:
+                _pocket_connect_lock = asyncio.Lock()
+            async with _pocket_connect_lock:
+                if _shared_pocket is not None and _shared_pocket._driver_alive():
+                    return
+                from bot.config import Config
+                from bot.pocket_handler import PocketHandler
+                config = Config(str(CONFIG_FILE))
+                handler = PocketHandler(config)
+                if await handler.connect():
+                    _shared_pocket = handler
+                    bal = await handler.get_balance()
+                    _patch_state({"pocket_option_connected": True, "balance": bal})
+                    socketio.emit("connection_update", {"pocket_option": True})
+
         submit(_do())
 
 

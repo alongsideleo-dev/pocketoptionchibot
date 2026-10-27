@@ -61,7 +61,7 @@ class LoggingConfig:
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG_FILE = BASE_DIR / "config.json"
+DEFAULT_CONFIG_FILE = Path(os.environ.get("BOT_DATA_DIR", str(BASE_DIR))).resolve() / "config.json"
 
 
 class Config:
