@@ -1,0 +1,9 @@
+.env
+.env.*
+__pycache__/
+*.pyc
+logs/
+config.local.json
+pocket_bot_session.json
+*.session
+*.session-journal

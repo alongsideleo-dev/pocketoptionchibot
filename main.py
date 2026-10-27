@@ -80,7 +80,7 @@ class TradingBot:
                 return False
 
             # Pocket Option connection
-            if self.pocket_handler.is_connected:
+            if self.pocket_handler._driver_alive():
                 self.logger.info("Pocket Option already connected - reusing open session.")
                 self.alert = None
             elif self.pocket_handler._has_credentials():
@@ -132,7 +132,7 @@ class TradingBot:
     async def _handle_signal(self, signal):
         try:
             self.logger.info(f"Received signal: {signal['type']} for {signal.get('asset')}")
-            if not self.pocket_handler or not self.pocket_handler.is_connected:
+            if not self.pocket_handler or not self.pocket_handler._driver_alive():
                 self.logger.warning(
                     "Signal ignored - Pocket Option not connected. Connect via Settings -> Pocket Option Account."
                 )
@@ -145,12 +145,12 @@ class TradingBot:
         """Check Pocket Option connection periodically."""
         self.logger.info("Health monitor started")
         while self.running:
-            interval = 60 if not self.pocket_handler.is_connected else 300
+            interval = 60 if not self.pocket_handler._driver_alive() else 300
             await asyncio.sleep(interval)
             if not self.running:
                 break
             try:
-                if not self.pocket_handler.is_connected:
+                if not self.pocket_handler._driver_alive():
                     if self.pocket_handler._has_credentials():
                         self.logger.info("Health monitor: attempting Pocket Option reconnect...")
                         if await self.pocket_handler.connect():
@@ -158,16 +158,6 @@ class TradingBot:
                             self.alert = None
                         else:
                             self.logger.error("Health monitor: Pocket Option reconnect failed")
-                else:
-                    if not self.pocket_handler._driver_alive():
-                        self.logger.warning("Health monitor: Pocket Option disconnected - reconnecting...")
-                        self.alert = "Pocket Option disconnected - reconnecting..."
-                        if await self.pocket_handler.connect():
-                            self.logger.info("Health monitor: reconnected OK")
-                            self.alert = None
-                        else:
-                            self.alert = "Pocket Option reconnect failed - check SSID in Settings"
-                            self.logger.error(f"Health monitor: {self.alert}")
             except Exception as e:
                 self.logger.error(f"Health monitor error: {e}")
 
@@ -179,7 +169,7 @@ class TradingBot:
                 break
             try:
                 self.config.refresh_if_changed()
-                if self.pocket_handler and self.pocket_handler.is_connected:
+                if self.pocket_handler and self.pocket_handler._driver_alive():
                     await self.pocket_handler.get_balance()
             except Exception as e:
                 self.logger.debug(f"Balance monitor: {e}")
