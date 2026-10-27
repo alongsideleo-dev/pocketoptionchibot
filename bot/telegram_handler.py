@@ -227,13 +227,62 @@ class SignalExecutor:
         self.pocket_handler = pocket_handler
         self.logger         = logging.getLogger(__name__)
         self.pending_signals: Dict[str, Any] = {}
+        self._seen_signals: Dict[tuple, datetime] = {}
+        self._signal_lock = asyncio.Lock()
+
+    def _signal_identity(self, signal: Dict[str, Any]):
+        """Same pair + direction + entry instant (UTC) = same signal.
+
+        Normalize equivalent pair spellings and timezone representations. The
+        entry date is included so the same time tomorrow is a fresh signal.
+        """
+        asset = self.pocket_handler._format_asset(str(signal['asset']))
+        direction = str(signal['direction']).strip().lower()
+        entry_text = signal.get('entry_time')
+        tz = self._resolve_tz(signal.get('timezone') or
+                              getattr(self.config.pocket_option, 'timezone', 'UTC-4'))
+        now = datetime.now(tz)
+        if entry_text:
+            clock = datetime.strptime(entry_text, '%H:%M:%S').time()
+            entry = now.replace(hour=clock.hour, minute=clock.minute,
+                                second=clock.second, microsecond=0)
+            # Same rollover rule as _calc_wait; a slightly past entry stays today.
+            if (entry - now).total_seconds() < -43200:
+                entry += timedelta(days=1)
+            instant = entry.astimezone(pytz.UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
+        else:
+            # Immediate signals have no entry time: don't collapse separate ones.
+            instant = str(signal.get('parsed_at', datetime.now().isoformat()))
+        return (asset, direction, instant)
 
     async def schedule_signal(self, signal: Dict[str, Any]) -> bool:
         try:
             if signal.get('type') == 'trade':
-                sid = f"trade_{signal['asset']}_{signal['direction']}_{signal['parsed_at']}"
-                self.pending_signals[sid] = {**signal, 'executed': False}
-                asyncio.create_task(self._execute(sid))
+                key = self._signal_identity(signal)
+                async with self._signal_lock:
+                    now = datetime.now(pytz.UTC)
+                    # Keep identities across completion to block reposted signals.
+                    # Prune old entries so the in-memory cache remains bounded.
+                    self._seen_signals = {
+                        k: stamp for k, stamp in self._seen_signals.items()
+                        if (now - stamp).total_seconds() < 48 * 3600
+                    }
+                    if key in self._seen_signals:
+                        self.logger.info(
+                            "Duplicate signal ignored: %s %s, entry %s",
+                            signal['asset'], str(signal['direction']).upper(),
+                            signal.get('entry_time') or 'immediate',
+                        )
+                        return False
+                    self._seen_signals[key] = now
+                    sid = f"trade_{len(self._seen_signals)}_{now.timestamp()}"
+                    self.pending_signals[sid] = {**signal, 'executed': False}
+                    self.logger.info(
+                        "Signal accepted: %s %s, entry %s",
+                        signal['asset'], str(signal['direction']).upper(),
+                        signal.get('entry_time') or 'immediate',
+                    )
+                    asyncio.create_task(self._execute(sid))
                 return True
             return False
         except Exception as e:
@@ -581,10 +630,11 @@ class TelegramHandler:
         if not msg or not msg.text:
             return
 
-        if msg.id in self.processed_message_ids:
+        message_key = (event.chat_id, msg.id)
+        if message_key in self.processed_message_ids:
             self.logger.debug(f"Ignoring already processed message ID: {msg.id}")
             return
-        self.processed_message_ids.add(msg.id)
+        self.processed_message_ids.add(message_key)
 
         self.logger.info(f"New Telegram message (ID: {msg.id}):\n{msg.text.strip()}")
         signal = self.parser.parse_signal(msg.text)

@@ -35,6 +35,7 @@ class PocketHandler:
         self.losses = 0                # settled losing trades today
         self.daily_pnl = 0.0           # realized profit/loss today
         self.active_trades = 0
+        self._sequence_lock = asyncio.Lock()  # one reservation per entire signal/recovery sequence
         self._trade_date = None
         self._day_start_balance: Optional[float] = None   # balance snapshot at 00:00
         self.balance: Optional[float] = None              # last known account balance (dashboard)
@@ -555,23 +556,29 @@ class PocketHandler:
             )
             return False
 
-        if self.active_trades >= self.config.trading.max_concurrent_trades:
-            self.logger.warning(
-                f"Max concurrent trades reached ({self.config.trading.max_concurrent_trades}). Skipping."
-            )
-            return False
+        # Reserve a slot for the *entire sequence*, not for each individual order.
+        # The lock prevents simultaneous signals from exceeding the dashboard limit.
+        async with self._sequence_lock:
+            limit = max(1, int(self.config.trading.max_concurrent_trades))
+            if self.active_trades >= limit:
+                self.logger.warning(
+                    "Signal skipped: max concurrent sequences reached (%d/%d).",
+                    self.active_trades, limit,
+                )
+                return False
+            self.active_trades += 1
+            self.logger.info("Trading sequence reserved: %d/%d active.", self.active_trades, limit)
 
         asset_name = self._format_asset(symbol)
-        self.active_trades += 1
-
-        if self.last_trade_time is not None:
-            elapsed = (datetime.now() - self.last_trade_time).total_seconds()
-            cooldown = self.config.pocket_option.wait_between_trades - elapsed
-            if cooldown > 0:
-                self.logger.info(f"Cooldown: waiting {cooldown:.1f}s...")
-                await asyncio.sleep(cooldown)
-
         try:
+            # A global cooldown would delay unrelated signals when concurrency > 1.
+            # Keep the configured cooldown only in single-sequence mode.
+            if limit == 1 and self.last_trade_time is not None:
+                elapsed = (datetime.now() - self.last_trade_time).total_seconds()
+                cooldown = self.config.pocket_option.wait_between_trades - elapsed
+                if cooldown > 0:
+                    self.logger.info("Cooldown: waiting %.1fs...", cooldown)
+                    await asyncio.sleep(cooldown)
             base_amount = (
                 pre_configured_amount
                 if pre_configured_amount is not None
@@ -585,7 +592,7 @@ class PocketHandler:
             if not use_martingale:
                 placed, _ = await self._place_one(
                     asset_name, direction, period_secs, base_amount, expiry,
-                    wait_result=False, step_label="Base Trade",
+                    wait_result=True, step_label="Base Trade",
                 )
                 return placed
 
@@ -702,4 +709,8 @@ class PocketHandler:
             return True
 
         finally:
-            self.active_trades = max(0, self.active_trades - 1)
+            async with self._sequence_lock:
+                self.active_trades = max(0, self.active_trades - 1)
+                self.logger.info("Trading sequence released: %d/%d active.",
+                                 self.active_trades,
+                                 max(1, int(self.config.trading.max_concurrent_trades)))
