@@ -69,7 +69,13 @@ class PocketHandler:
             if not ssid or not str(ssid).strip():
                 self.logger.error("Pocket Option SSID missing in dashboard settings.")
                 return False
-            is_demo = (self.config.trading.account_type.lower() == "demo") or self.config.pocket_option.is_demo
+            account_type = str(self.config.trading.account_type).strip().lower()
+            if account_type not in ("demo", "live"):
+                self.logger.error("Invalid account_type setting; expected demo or live.")
+                return False
+            is_demo = account_type == "demo"
+            if bool(self.config.pocket_option.is_demo) != is_demo:
+                self.logger.warning("Conflicting account mode settings: using trading.account_type=%s.", account_type)
             old_client = self.client
             self.is_connected = False
             self.client = None
@@ -84,7 +90,13 @@ class PocketHandler:
                 client = AsyncPocketOptionClient(ssid=ssid, is_demo=is_demo)
                 if hasattr(client, "_websocket"):
                     client._websocket.add_event_handler("json_data", self._on_raw_json_data)
-                await asyncio.wait_for(client.connect(), timeout=25.0)
+                connect_timeout = max(25.0, min(90.0, float(os.getenv("POCKET_CONNECT_TIMEOUT", "60"))))
+                self.logger.info("Starting broker connection; mode=%s, timeout=%.0fs, client=%s.",
+                                 account_type, connect_timeout, type(client).__name__)
+                started_at = time.monotonic()
+                await asyncio.wait_for(client.connect(), timeout=connect_timeout)
+                self.logger.info("Broker connect() returned after %.1fs; connected=%s.",
+                                 time.monotonic() - started_at, bool(getattr(client, "is_connected", False)))
                 for _ in range(10):
                     if getattr(client, "is_connected", False):
                         break
@@ -103,11 +115,11 @@ class PocketHandler:
                     self.logger.warning("Connected, but balance refresh failed: %s", type(exc).__name__)
                 return True
             except asyncio.TimeoutError:
-                self.logger.error("Pocket Option connect timed out after 25 seconds; check library version and network.")
+                self.logger.error("Pocket Option %s connect timed out after %.0fs; cannot distinguish authentication, endpoint, or network without library diagnostics.", account_type, connect_timeout)
                 return False
             except Exception as exc:
                 # Avoid logging exception messages that could contain SSIDs.
-                self.logger.error("Pocket Option connect failed: %s", type(exc).__name__)
+                self.logger.error("Pocket Option %s connect failed: %s", account_type, type(exc).__name__)
                 return False
             finally:
                 if not self.is_connected:
