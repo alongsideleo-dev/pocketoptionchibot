@@ -11,6 +11,7 @@ import os
 import json
 import logging
 import time
+import hashlib
 from datetime import datetime
 from typing import Optional, Any, List, Dict
 from .config import Config
@@ -37,6 +38,7 @@ class PocketHandler:
         self.active_trades = 0
         self._sequence_lock = asyncio.Lock()  # one reservation per entire signal/recovery sequence
         self._connection_lock = asyncio.Lock()  # serialize dashboard and health-monitor connections
+        self._connected_identity = None  # (credential digest, account mode); never log secrets
         self._trade_date = None
         self._day_start_balance: Optional[float] = None   # balance snapshot at 00:00
         self.balance: Optional[float] = None              # last known account balance (dashboard)
@@ -59,25 +61,32 @@ class PocketHandler:
     async def connect(self, **kwargs) -> bool:
         """Serialize connection attempts and verify the broker client state."""
         async with self._connection_lock:
-            if self._driver_alive():
-                self.logger.info("Pocket Option connection already active; reusing it.")
-                return True
             if AsyncPocketOptionClient is None:
                 self.logger.error("pocketoptionapi_async is not installed.")
                 return False
-            ssid = os.getenv("POCKET_OPTION_SSID") or self.config.pocket_option.ssid
+            env_ssid = os.getenv("POCKET_OPTION_SSID")
+            ssid = env_ssid or self.config.pocket_option.ssid
             if not ssid or not str(ssid).strip():
-                self.logger.error("Pocket Option SSID missing in dashboard settings.")
+                self.logger.error("Pocket Option SSID missing. Set a fresh session in Settings.")
                 return False
             account_type = str(self.config.trading.account_type).strip().lower()
             if account_type not in ("demo", "live"):
                 self.logger.error("Invalid account_type setting; expected demo or live.")
                 return False
             is_demo = account_type == "demo"
+            identity = (hashlib.sha256(str(ssid).encode('utf-8')).digest(), account_type)
+            if self._driver_alive() and self._connected_identity == identity:
+                self.logger.info("Pocket Option %s session already connected; reusing it.", account_type)
+                return True
+            if self._driver_alive():
+                self.logger.info("Pocket Option mode or session changed; reconnecting to %s.", account_type)
+            if env_ssid:
+                self.logger.warning("POCKET_OPTION_SSID environment variable overrides dashboard SSID; changes in Settings will NOT take effect until this variable is removed or updated.")
             if bool(self.config.pocket_option.is_demo) != is_demo:
                 self.logger.warning("Conflicting account mode settings: using trading.account_type=%s.", account_type)
             old_client = self.client
             self.is_connected = False
+            self._connected_identity = None
             self.client = None
             if old_client is not None:
                 try:
@@ -106,6 +115,7 @@ class PocketHandler:
                     return False
                 self.client = client
                 self.is_connected = True
+                self._connected_identity = identity
                 self.logger.info("Successfully connected to Pocket Option.")
                 try:
                     balance = await asyncio.wait_for(self.get_balance(), timeout=10.0)
@@ -115,7 +125,7 @@ class PocketHandler:
                     self.logger.warning("Connected, but balance refresh failed: %s", type(exc).__name__)
                 return True
             except asyncio.TimeoutError:
-                self.logger.error("Pocket Option %s connect timed out after %.0fs; cannot distinguish authentication, endpoint, or network without library diagnostics.", account_type, connect_timeout)
+                self.logger.error("Pocket Option %s authentication/connection did not finish in %.0fs. Check preceding pocketoptionapi_async region and auth logs; a WebSocket opening alone does NOT confirm login. Refresh the correct %s session, and check for an SSID environment override.", account_type, connect_timeout, account_type)
                 return False
             except Exception as exc:
                 # Avoid logging exception messages that could contain SSIDs.
@@ -123,6 +133,7 @@ class PocketHandler:
                 return False
             finally:
                 if not self.is_connected:
+                    self._connected_identity = None
                     self.client = None
                     if client is not None:
                         try:
@@ -145,6 +156,7 @@ class PocketHandler:
             client = self.client
             self.client = None
             self.is_connected = False
+            self._connected_identity = None
             if client is not None:
                 try:
                     await asyncio.wait_for(client.disconnect(), timeout=8.0)
@@ -563,8 +575,8 @@ class PocketHandler:
         martingale_times: Optional[List[str]] = None,
         timezone: Optional[str] = None,
     ) -> bool:
-        if not self.is_connected or not self.client:
-            self.logger.error("PocketHandler not connected.")
+        if not self._driver_alive():
+            self.logger.error("PocketHandler not authenticated/connected; refusing to place a trade.")
             return False
 
         await self._refresh_balance_stats()
