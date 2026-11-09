@@ -15,6 +15,7 @@ class ChannelConfig:
     """Configuration for a single monitored Telegram channel."""
     enabled: bool = True
     identifier: Union[str, int] = ""   # group name, @username, or numeric ID
+    timezone: str = ""  # blank inherits the global signal timezone
 
 
 @dataclass
@@ -99,6 +100,7 @@ class Config:
                             channels.append(ChannelConfig(
                                 enabled=bool(c.get('enabled', True)),
                                 identifier=ident,
+                                timezone=str(c.get("timezone") or "").strip(),
                             ))
                     elif isinstance(c, (str, int)) and str(c).strip():
                         channels.append(ChannelConfig(
@@ -199,6 +201,7 @@ class Config:
                         {
                             'enabled':    c.enabled,
                             'identifier': c.identifier,
+                            'timezone': c.timezone,
                         }
                         for c in self.telegram.channels
                     ],

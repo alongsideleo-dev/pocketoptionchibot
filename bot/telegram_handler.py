@@ -50,7 +50,7 @@ class SignalParser:
         cleaned = re.sub(r'[*_~`#|]', '', cleaned)
         return cleaned
 
-    def parse_signal(self, text: str) -> Optional[Dict[str, Any]]:
+    def parse_signal(self, text: str, channel_timezone: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Parse a trade signal message.
         Supports:
@@ -171,7 +171,7 @@ class SignalParser:
 
             # Timezone check (e.g. UTC +5:30, UTC+0)
             if not timezone_str:
-                tz_m = re.search(r'(UTC\s*[+-]\s*\d{1,2}:\d{2}|[+-]\d{1,2}:\d{2})', clean_line, re.IGNORECASE)
+                tz_m = re.search(r'(?<!\w)(UTC\s*[+-]\s*\d{1,2}(?::\d{2})?|[+-]\d{1,2}:\d{2})(?!\d)', clean_line, re.IGNORECASE)
                 if tz_m:
                     timezone_str = tz_m.group(1).replace(' ', '').upper()
 
@@ -196,7 +196,7 @@ class SignalParser:
             default_tz = 'UTC-4'
             if self.config and hasattr(self.config, 'pocket_option'):
                 default_tz = getattr(self.config.pocket_option, 'timezone', 'UTC-4')
-            signal_tz = timezone_str or default_tz
+            signal_tz = timezone_str or channel_timezone or default_tz
             # Sort martingale steps chronologically
             martingale_steps.sort(key=lambda x: x['step'])
             signal = {
@@ -385,8 +385,10 @@ class SignalExecutor:
             try:
                 return pytz.timezone(tz_str)
             except Exception:
-                return pytz.timezone('Africa/Lagos')
+                raise ValueError(f'Unsupported signal timezone: {tz_str}')
         offset_mins = sign * (hours * 60 + mins)
+        if hours > 23 or mins > 59 or abs(offset_mins) > 840:
+            raise ValueError(f'Invalid UTC offset: {tz_str}')
         return pytz.FixedOffset(offset_mins)
 
     def _calc_wait(self, entry_time_str: str, tz_str: Optional[str]) -> Optional[float]:
@@ -422,6 +424,7 @@ class TelegramHandler:
         self.api_hash        = self.config.telegram.api_hash
         self.phone_number    = None
         self.processed_message_ids = set()
+        self._channel_timezones = {}
 
     async def initialize(self, pocket_handler: PocketHandler) -> bool:
         try:
@@ -598,6 +601,7 @@ class TelegramHandler:
                 return
 
             watch_ids: List[int] = []
+            self._channel_timezones = {}
 
             for ch in enabled:
                 try:
@@ -606,6 +610,15 @@ class TelegramHandler:
                     for pid in (entity.id, peer_id):
                         if pid not in watch_ids:
                             watch_ids.append(pid)
+                    configured_tz = str(getattr(ch, 'timezone', '') or '').strip()
+                    if configured_tz:
+                        try:
+                            SignalExecutor._resolve_tz(configured_tz)
+                        except (ValueError, KeyError) as exc:
+                            self.logger.error('Invalid timezone for channel %s: %s', ch.identifier, exc)
+                            continue
+                    for pid in (entity.id, peer_id):
+                        self._channel_timezones[pid] = configured_tz
                     title = getattr(entity, 'title', ch.identifier)
                     self.logger.info(f"Watching channel/group: {title} (ID: {peer_id})")
                 except Exception as e:
@@ -637,8 +650,11 @@ class TelegramHandler:
         self.processed_message_ids.add(message_key)
 
         self.logger.info(f"New Telegram message (ID: {msg.id}):\n{msg.text.strip()}")
-        signal = self.parser.parse_signal(msg.text)
+        channel_tz = self._channel_timezones.get(event.chat_id, '')
+        signal = self.parser.parse_signal(msg.text, channel_timezone=channel_tz)
         if signal and self.signal_callback:
+            self.logger.info('Signal channel=%s timezone=%s (configured=%s)',
+                             event.chat_id, signal.get('timezone'), channel_tz or 'global')
             await self.signal_callback(signal)
 
     async def disconnect(self):
