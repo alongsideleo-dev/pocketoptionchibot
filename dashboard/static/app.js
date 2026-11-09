@@ -709,65 +709,50 @@ async function loadSettings() {
   }
 }
 
-function renderChannels(channels) {
-  const box = $('channel-list');
-  if (!box) return;
-  const list = Array.isArray(channels) ? channels : [];
-  if (list.length === 0) {
-    box.innerHTML = `
-      <div class="channel-row" data-idx="0">
-        <input type="checkbox" class="ch-enabled" checked>
-        <input type="text" class="form-input ch-id" value="" placeholder="Channel username or -100...">
-        <button class="btn btn-ghost btn-sm text-red" onclick="removeChannel(0)">✕</button>
-      </div>
-    `;
-    return;
-  }
-  box.innerHTML = list.map((ch, idx) => {
-    const isObj = (typeof ch === 'object' && ch !== null);
-    const enabled = isObj ? (ch.enabled !== false) : true;
-    const identifier = isObj ? (ch.identifier ?? '') : ch;
-    return `
-      <div class="channel-row" data-idx="${idx}">
-        <input type="checkbox" class="ch-enabled" ${enabled ? 'checked' : ''}>
-        <input type="text" class="form-input ch-id" value="${escHtml(identifier)}" placeholder="Channel username or -100...">
-        <button class="btn btn-ghost btn-sm text-red" onclick="removeChannel(${idx})">✕</button>
-      </div>
-    `;
-  }).join('');
+// Independent channel signal timezones. Blank inherits the global timezone.
+const CHANNEL_TIMEZONES = [
+  ['', 'Use global timezone'],
+  ...Array.from({length: 27}, (_, i) => i - 12).filter(h => h >= -12 && h <= 14).map(h => [`UTC${h >= 0 ? '+' : ''}${h}`, `UTC${h >= 0 ? '+' : ''}${h}`]),
+  ['UTC+5:30', 'UTC+5:30'], ['UTC+5:45', 'UTC+5:45'], ['UTC+9:30', 'UTC+9:30'],
+  ['Africa/Lagos', 'Lagos (WAT)'], ['Europe/London', 'London (automatic DST)'],
+  ['Europe/Paris', 'Paris (automatic DST)'], ['America/New_York', 'New York (automatic DST)'],
+  ['America/Chicago', 'Chicago (automatic DST)'], ['America/Edmonton', 'Calgary (automatic DST)'],
+  ['America/Los_Angeles', 'Los Angeles (automatic DST)'], ['Asia/Dubai', 'Dubai'],
+  ['Asia/Kolkata', 'India'], ['Asia/Tokyo', 'Tokyo']
+];
+function channelTimezoneOptions(selected = '') {
+  const options = [...CHANNEL_TIMEZONES];
+  if (selected && !options.some(([v]) => v === selected)) options.push([selected, selected]);
+  return options.map(([v, label]) => `<option value="${escHtml(v)}" ${selected === v ? 'selected' : ''}>${escHtml(label)}</option>`).join('');
 }
-
-function addChannel() {
-  const box = $('channel-list');
-  if (!box) return;
-  const idx = box.children.length;
+function channelRow(ch = {}) {
+  const obj = typeof ch === 'object' && ch !== null;
+  const enabled = obj ? ch.enabled !== false : true;
+  const identifier = obj ? ch.identifier ?? '' : ch;
+  const timezone = obj ? ch.timezone || '' : '';
   const div = document.createElement('div');
   div.className = 'channel-row';
-  div.setAttribute('data-idx', idx);
-  div.innerHTML = `
-    <input type="checkbox" class="ch-enabled" checked>
-    <input type="text" class="form-input ch-id" placeholder="Channel username or -100...">
-    <button class="btn btn-ghost btn-sm text-red" onclick="removeChannel(${idx})">✕</button>
-  `;
-  box.appendChild(div);
+  div.style.cssText = 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px';
+  div.innerHTML = `<input type="checkbox" class="ch-enabled" ${enabled ? 'checked' : ''}>
+    <input type="text" class="form-input ch-id" style="flex:2;min-width:160px" value="${escHtml(identifier)}" placeholder="Channel username or -100...">
+    <select class="form-select ch-timezone" style="flex:1;min-width:165px" aria-label="Signal timezone">${channelTimezoneOptions(timezone)}</select>
+    <button type="button" class="btn btn-ghost btn-sm text-red ch-remove" title="Remove channel">✕</button>`;
+  div.querySelector('.ch-remove').addEventListener('click', () => div.remove());
+  return div;
 }
-
-function removeChannel(idx) {
-  const row = document.querySelector(`.channel-row[data-idx="${idx}"]`);
-  if (row) row.remove();
+function renderChannels(channels) {
+  const box = $('channel-list'); if (!box) return;
+  box.replaceChildren(...((Array.isArray(channels) && channels.length ? channels : [{}]).map(channelRow)));
 }
-
+function addChannel() { $('channel-list')?.appendChild(channelRow()); }
+function removeChannel(idx) { document.querySelectorAll('#channel-list .channel-row')[idx]?.remove(); }
 function getChannelsFromDOM() {
-  const rows = document.querySelectorAll('#channel-list .channel-row');
-  const out = [];
-  rows.forEach(r => {
-    const enabled = r.querySelector('.ch-enabled')?.checked ?? true;
-    const idVal   = r.querySelector('.ch-id')?.value.trim() || '';
-    if (idVal) {
-      out.push({ enabled, identifier: isNaN(idVal) ? idVal : Number(idVal) });
-    }
-  });
-  return out;
+  return [...document.querySelectorAll('#channel-list .channel-row')].map(row => {
+    const identifier = row.querySelector('.ch-id')?.value.trim() || '';
+    return { enabled: row.querySelector('.ch-enabled')?.checked ?? true,
+      identifier: /^-?\d+$/.test(identifier) ? Number(identifier) : identifier,
+      timezone: row.querySelector('.ch-timezone')?.value || '' };
+  }).filter(c => c.identifier !== '');
 }
 
 function toggleMartingaleFields() {
