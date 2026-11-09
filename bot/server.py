@@ -24,6 +24,7 @@ SocketIO Events (outgoing):
 """
 
 import asyncio
+import concurrent.futures
 import re
 import json
 import logging
@@ -624,14 +625,21 @@ def pocket_option_connect():
             # Never disconnect a live session owned by the running bot.
             if _bot_instance is not None and _bot_instance.running:
                 return False, None, "Stop the bot before changing the Pocket Option connection."
-            if _shared_pocket is not None:
-                try:
-                    await _shared_pocket.disconnect()
-                except Exception:
-                    pass
-                _shared_pocket = None
             config = Config(str(CONFIG_FILE))
-            handler = PocketHandler(config)
+            if _shared_pocket is not None and _shared_pocket._driver_alive():
+                # Keep a working session. connect() reuses it when the SSID and
+                # account mode are unchanged, and reconnects only when they differ,
+                # so a second Connect click no longer drops a good login.
+                handler = _shared_pocket
+                handler.config = config
+            else:
+                if _shared_pocket is not None:
+                    try:
+                        await _shared_pocket.disconnect()
+                    except Exception:
+                        pass
+                    _shared_pocket = None
+                handler = PocketHandler(config)
             ok = await handler.connect()
             if ok:
                 _shared_pocket = handler
@@ -647,6 +655,12 @@ def pocket_option_connect():
         if ok:
             return jsonify({"success": True, "balance": bal})
         return jsonify({"success": False, "message": msg})
+    except concurrent.futures.TimeoutError:
+        # The attempt keeps running on the bot loop; only this request stopped waiting.
+        return jsonify({"success": False, "message": (
+            "Still connecting in the background. A first live login can take up to "
+            "3 minutes while servers are tried one by one. Do NOT press Connect again; "
+            "the Pocket Option status turns connected by itself when login finishes.")})
     except Exception as e:
         _patch_state({"pocket_option_connected": False})
         return jsonify({"success": False, "message": f"Connection error: {e}"})
