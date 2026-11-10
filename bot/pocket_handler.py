@@ -440,6 +440,32 @@ class PocketHandler:
             self._day_start_balance = None
             self._trade_date        = today
 
+    async def reset_daily_stats(self):
+        """Manual dashboard reset: zero today's counters and restart P&L from the current balance.
+
+        Returns (ok, message). Refused while trades are open, because the stake of
+        an open trade is already deducted from the balance and would distort the
+        new starting point. Note this also clears the daily loss and daily trade
+        limits' progress for today.
+        """
+        if self.active_trades > 0:
+            return False, "A trade sequence is still open. Wait until it settles, then reset."
+        self._trade_date = None
+        self._reset_daily_counters_if_new_day()
+        self.last_trade = None
+        self.last_trade_time = None
+        self._mg_reset()
+        if self._driver_alive():
+            try:
+                balance = await asyncio.wait_for(self.get_balance(), timeout=10.0)
+                self._day_start_balance = balance
+                self.logger.info("Daily stats reset from dashboard. New starting balance: $%.2f", balance)
+            except Exception as exc:
+                self.logger.warning("Daily stats reset; balance not read (%s). It is taken on the next refresh.", type(exc).__name__)
+        else:
+            self.logger.info("Daily stats reset from dashboard (not connected; starting balance is taken on next connect).")
+        return True, "Today's P&L, daily loss, win rate and trade count were reset."
+
     async def _refresh_balance_stats(self):
         """Snapshot opening balance and update daily realized P&L and drawdown."""
         self._reset_daily_counters_if_new_day()

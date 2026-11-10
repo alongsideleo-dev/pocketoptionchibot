@@ -666,6 +666,20 @@ def pocket_option_connect():
         return jsonify({"success": False, "message": f"Connection error: {e}"})
 
 
+@app.route("/api/stats/reset", methods=["POST"])
+def stats_reset():
+    """Reset today's dashboard figures (P&L, daily loss, win rate, trade count)."""
+    bot = _bot_instance
+    ph = (bot.pocket_handler if bot is not None else None) or _shared_pocket
+    if ph is None:
+        return jsonify({"success": False, "message": "Connect Pocket Option first."})
+    try:
+        ok, msg = run_sync(ph.reset_daily_stats(), timeout=20)
+        return jsonify({"success": bool(ok), "message": msg})
+    except Exception as e:
+        return jsonify({"success": False, "message": f"Reset failed: {type(e).__name__}"})
+
+
 @app.route("/api/pocket_option/disconnect", methods=["POST"])
 def pocket_option_disconnect():
     global _shared_pocket
