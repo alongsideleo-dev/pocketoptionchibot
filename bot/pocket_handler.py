@@ -85,6 +85,7 @@ class PocketHandler:
         self._sequence_lock = asyncio.Lock()  # one reservation per entire signal/recovery sequence
         self._connection_lock = asyncio.Lock()  # serialize dashboard and health-monitor connections
         self._connected_identity = None  # (credential digest, account mode); never log secrets
+        self._stats_identity = None  # account the daily stats below belong to
         self._trade_date = None
         self._day_start_balance: Optional[float] = None   # balance snapshot at 00:00
         self.balance: Optional[float] = None              # last known account balance (dashboard)
@@ -209,6 +210,14 @@ class PocketHandler:
                 self.client = client
                 self.is_connected = True
                 self._connected_identity = identity
+                if self._stats_identity is not None and self._stats_identity != identity:
+                    # Different account or demo/live mode: yesterday's or the other
+                    # account's opening balance must not be compared with this one.
+                    self.logger.info("Account or mode changed; resetting today's P&L, loss and trade counters.")
+                    self._trade_date = None
+                    self._reset_daily_counters_if_new_day()
+                    self.balance = None
+                self._stats_identity = identity
                 region_name = self._connected_region_name(client)
                 if region_name and not is_demo:
                     global _LAST_GOOD_REGION
