@@ -432,6 +432,16 @@ async function loadInitialLogs() {
 }
 
 function initLogControls() {
+  $('btn-reset-stats')?.addEventListener('click', async () => {
+    if (!confirm("Reset today's P&L, daily loss, win rate and trade count to zero?\n\nThis also restarts the daily loss limit and daily trade limit from zero.")) return;
+    try {
+      const res = await api('/api/stats/reset', 'POST');
+      showToast(res.message || (res.success ? 'Stats reset.' : 'Reset failed.'), res.success ? 'success' : 'error');
+      fetchStatus();
+    } catch (e) {
+      showToast('Reset failed: ' + e.message, 'error');
+    }
+  });
   $('btn-clear-log')?.addEventListener('click', () => {
     const p = $('log-panel');
     if (p) p.innerHTML = '<div class="log-entry"><span class="log-time">--:--:--</span><span class="log-msg text-dim">Console view cleared (full history preserved in log file)</span></div>';
