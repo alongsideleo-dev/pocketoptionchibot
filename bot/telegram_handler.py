@@ -32,6 +32,28 @@ from telethon.tl.types import Channel, Chat
 from .pocket_handler import PocketHandler
 from .config import Config, ChannelConfig
 
+# ── Automatic signal-time conversion ─────────────────────────────────────────
+# With the signal timezone set to AUTO, the bot works out each signal's timezone
+# from the moment Telegram says the message was posted. Signals are posted a few
+# minutes before their entry, so the entry is the next time the clock shows the
+# signal's minutes (in any whole-hour timezone). A signal must be posted less
+# than AUTO_MAX_AHEAD_S before its entry; anything else is read as already
+# passed and skipped, never traded at a guessed time.
+AUTO_TZ = 'AUTO'
+AUTO_MAX_AHEAD_S = 50 * 60
+
+# The dashboard viewer's UTC offset in minutes (reported by the browser), used
+# only to print entry times in the viewer's local time in the log.
+DISPLAY_UTC_OFFSET_MIN: Optional[int] = None
+
+
+def format_local(instant: datetime) -> str:
+    """'11:30:00 your time' when the viewer's offset is known, else '17:30:00 UTC'."""
+    utc = instant.astimezone(pytz.UTC)
+    if DISPLAY_UTC_OFFSET_MIN is None:
+        return utc.strftime('%H:%M:%S') + ' UTC'
+    return (utc + timedelta(minutes=DISPLAY_UTC_OFFSET_MIN)).strftime('%H:%M:%S') + ' your time'
+
 
 class SignalParser:
     """Parses incoming trade signals from Telegram messages."""
@@ -48,6 +70,8 @@ class SignalParser:
         cleaned = re.sub(r'[\U0001F1E6-\U0001F1FF]', '', norm)
         # Strip markdown formatting characters that can split currency pairs (e.g. EUR**/GBP -> EUR/GBP)
         cleaned = re.sub(r'[*_~`#|]', '', cleaned)
+        # Quotex-style suffix: "CADJPY-OTCq" means the OTC pair.
+        cleaned = re.sub(r'\bOTCq\b', 'OTC', cleaned, flags=re.IGNORECASE)
         return cleaned
 
     def parse_signal(self, text: str, channel_timezone: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -242,7 +266,9 @@ class SignalExecutor:
         tz = self._resolve_tz(signal.get('timezone') or
                               getattr(self.config.pocket_option, 'timezone', 'UTC-4'))
         now = datetime.now(tz)
-        if entry_text:
+        if signal.get('entry_at') is not None:
+            instant = signal['entry_at'].astimezone(pytz.UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
+        elif entry_text:
             clock = datetime.strptime(entry_text, '%H:%M:%S').time()
             entry = now.replace(hour=clock.hour, minute=clock.minute,
                                 second=clock.second, microsecond=0)
@@ -308,7 +334,7 @@ class SignalExecutor:
             # Calculate wait time if entry time is specified
             wait_secs = None
             if signal.get('entry_time'):
-                wait_secs = self._calc_wait(signal['entry_time'], signal.get('timezone'))
+                wait_secs = self._calc_wait(signal['entry_time'], signal.get('timezone'), signal.get('entry_at'))
                 grace = float(getattr(self.config.pocket_option, 'late_entry_grace_seconds', 5.0))
                 if wait_secs is None:
                     self.logger.warning(
@@ -335,7 +361,9 @@ class SignalExecutor:
                 sleep_time = max(0.0, wait_secs - early)
                 if sleep_time > 0:
                     self.logger.info(
-                        f"Pair {asset} queued. Waiting {sleep_time:.1f}s (entering {early}s before {signal['entry_time']})..."
+                        f"Pair {asset} queued. Waiting {sleep_time:.1f}s (entering {early}s before {signal['entry_time']}"
+                        + (f" = {format_local(signal['entry_at'])}" if signal.get('entry_at') is not None else "")
+                        + ")..."
                     )
                     await asyncio.sleep(sleep_time)
 
@@ -364,6 +392,9 @@ class SignalExecutor:
         if not tz_str or str(tz_str).strip().upper() in ('DEFAULT', 'LOCAL'):
             return pytz.FixedOffset(-240)
         clean = str(tz_str).strip().upper()
+        if clean == AUTO_TZ:
+            # AUTO is resolved per signal by resolve_entry(); UTC is only a placeholder.
+            return pytz.UTC
         if clean in ('WAT', 'WEST AFRICA TIME'):
             return pytz.timezone('Africa/Lagos')
         if clean in ('UTC', 'GMT', 'Z'):
@@ -391,8 +422,47 @@ class SignalExecutor:
             raise ValueError(f'Invalid UTC offset: {tz_str}')
         return pytz.FixedOffset(offset_mins)
 
-    def _calc_wait(self, entry_time_str: str, tz_str: Optional[str]) -> Optional[float]:
-        """Calculates seconds until the target entry time in WAT or signal timezone."""
+    @staticmethod
+    def resolve_entry(entry_time_str: str, tz_setting: Optional[str], posted_at: datetime):
+        """Turn a signal's clock time into an exact instant.
+
+        Returns (entry_at_utc, timezone_label, auto_detected).
+        AUTO: the entry is the occurrence of the signal's minute:second nearest
+        after the message was posted (up to AUTO_MAX_AHEAD_S ahead, otherwise it
+        is read as already passed). The timezone label is what that implies.
+        Fixed timezone: the occurrence of that clock time nearest to the post time.
+        """
+        clock = datetime.strptime(entry_time_str, "%H:%M:%S").time()
+        if posted_at.tzinfo is None:
+            posted_at = pytz.UTC.localize(posted_at)
+        ref = posted_at.astimezone(pytz.UTC)
+
+        if str(tz_setting or '').strip().upper() == AUTO_TZ:
+            entry = ref.replace(minute=clock.minute, second=clock.second, microsecond=0)
+            lead = (entry - ref).total_seconds()
+            if lead > AUTO_MAX_AHEAD_S:
+                entry -= timedelta(hours=1)
+            elif lead <= AUTO_MAX_AHEAD_S - 3600:
+                entry += timedelta(hours=1)
+            offset = (clock.hour - entry.hour) % 24
+            if offset > 14:
+                offset -= 24
+            return entry, f"UTC{offset:+d}", True
+
+        tz = SignalExecutor._resolve_tz(tz_setting)
+        ref_tz = ref.astimezone(tz)
+        entry = ref_tz.replace(hour=clock.hour, minute=clock.minute, second=clock.second, microsecond=0)
+        delta = (entry - ref_tz).total_seconds()
+        if delta < -43200:
+            entry += timedelta(days=1)
+        elif delta > 43200:
+            entry -= timedelta(days=1)
+        return entry.astimezone(pytz.UTC), str(tz_setting).strip(), False
+
+    def _calc_wait(self, entry_time_str: str, tz_str: Optional[str], entry_at: Optional[datetime] = None) -> Optional[float]:
+        """Seconds until the entry. Uses the exact instant when the signal carries one."""
+        if entry_at is not None:
+            return (entry_at - datetime.now(pytz.UTC)).total_seconds()
         try:
             t = datetime.strptime(entry_time_str, "%H:%M:%S").time()
             target_tz = self._resolve_tz(tz_str or getattr(self.config.pocket_option, 'timezone', 'UTC-4'))
@@ -425,6 +495,7 @@ class TelegramHandler:
         self.phone_number    = None
         self.processed_message_ids = set()
         self._channel_timezones = {}
+        self._channel_titles = {}  # chat id -> channel name, for the dashboard and log
 
     async def initialize(self, pocket_handler: PocketHandler) -> bool:
         try:
@@ -546,7 +617,7 @@ class TelegramHandler:
         except Exception as e:
             self.logger.error(f"Could not save session: {e}")
 
-    async def _resolve_channel(self, identifier):
+    async def _resolve_channel(self, identifier, dialogs=None):
         """Resolve a channel identifier (name, @username, or numeric ID) to a Telethon entity."""
         is_plain = isinstance(identifier, str) and ' ' in identifier.strip()
 
@@ -561,7 +632,8 @@ class TelegramHandler:
                 except Exception:
                     pass
 
-        dialogs = await self.client.get_dialogs(limit=None)
+        if dialogs is None:
+            dialogs = await self.client.get_dialogs(limit=None)
         id_str = str(identifier).strip()
         id_lower = id_str.lower()
         id_norm = unicodedata.normalize('NFKC', id_str).lower()
@@ -602,10 +674,20 @@ class TelegramHandler:
 
             watch_ids: List[int] = []
             self._channel_timezones = {}
+            self._channel_titles = {}
+            not_found: List[str] = []
+
+            # Fetch the account's chat list ONCE. Fetching it per channel made
+            # Telegram impose 30s flood waits, delaying monitoring by minutes.
+            try:
+                all_dialogs = await self.client.get_dialogs(limit=None)
+            except Exception as exc:
+                self.logger.warning("Could not fetch Telegram chat list once (%s); falling back to per-channel lookup.", type(exc).__name__)
+                all_dialogs = None
 
             for ch in enabled:
                 try:
-                    entity = await self._resolve_channel(ch.identifier)
+                    entity = await self._resolve_channel(ch.identifier, all_dialogs)
                     peer_id = get_peer_id(entity)
                     for pid in (entity.id, peer_id):
                         if pid not in watch_ids:
@@ -620,9 +702,21 @@ class TelegramHandler:
                     for pid in (entity.id, peer_id):
                         self._channel_timezones[pid] = configured_tz
                     title = getattr(entity, 'title', ch.identifier)
+                    for pid in (entity.id, peer_id):
+                        self._channel_titles[pid] = str(title)
                     self.logger.info(f"Watching channel/group: {title} (ID: {peer_id})")
+                except ValueError:
+                    not_found.append(str(ch.identifier))
                 except Exception as e:
                     self.logger.error(f"Could not resolve channel '{ch.identifier}': {e}")
+
+            if not_found:
+                self.logger.warning(
+                    "%d of %d enabled channels are NOT in this Telegram account's chat list, so no signals "
+                    "will arrive from them. Join them with this Telegram account (or fix the name): %s",
+                    len(not_found), len(enabled), "; ".join(not_found),
+                )
+            self.logger.info("Watching %d of %d enabled channels.", len(enabled) - len(not_found), len(enabled))
 
             if not watch_ids:
                 self.logger.error("No channels could be resolved. Check telegram.channels in config.")
@@ -652,9 +746,42 @@ class TelegramHandler:
         self.logger.info(f"New Telegram message (ID: {msg.id}):\n{msg.text.strip()}")
         channel_tz = self._channel_timezones.get(event.chat_id, '')
         signal = self.parser.parse_signal(msg.text, channel_timezone=channel_tz)
+        channel_name = self._channel_titles.get(event.chat_id)
+        if not channel_name:
+            channel_name = getattr(getattr(event, 'chat', None), 'title', None) or str(event.chat_id)
+        if signal:
+            signal['channel'] = channel_name
+        if signal and not signal.get('entry_time'):
+            # Results recaps, announcements and chat lines mention a pair and a
+            # direction but no entry time. Never trade on those.
+            self.logger.info("Message from '%s' ignored: no entry time (%s %s). Only signals with an entry time are traded.",
+                             channel_name, signal.get('asset'), str(signal.get('direction')).upper())
+            return
+        if signal and signal.get('entry_time'):
+            # Fix the entry to an exact instant now, from the time Telegram says
+            # the message was posted, so a delayed delivery cannot shift it.
+            try:
+                posted_at = getattr(msg, 'date', None) or datetime.now(pytz.UTC)
+                entry_at, tz_label, auto = SignalExecutor.resolve_entry(
+                    signal['entry_time'], signal.get('timezone'), posted_at)
+                signal['entry_at'] = entry_at
+                signal['timezone'] = tz_label
+                signal['tz_auto'] = auto
+                lead = (entry_at - datetime.now(pytz.UTC)).total_seconds()
+                self.logger.info(
+                    "Entry %s read as %s (%s) = %s%s; %s.",
+                    signal['entry_time'], tz_label,
+                    'auto-detected from post time' if auto else 'fixed setting or written in signal',
+                    format_local(entry_at),
+                    '' if DISPLAY_UTC_OFFSET_MIN is None else ' / ' + entry_at.strftime('%H:%M:%S') + ' UTC',
+                    ('in %.0fs' % lead) if lead >= 0 else ('passed %.0fs ago' % -lead),
+                )
+            except Exception as exc:
+                self.logger.warning("Could not convert entry time %s (%s); using timezone setting as-is.",
+                                    signal.get('entry_time'), type(exc).__name__)
         if signal and self.signal_callback:
-            self.logger.info('Signal channel=%s timezone=%s (configured=%s)',
-                             event.chat_id, signal.get('timezone'), channel_tz or 'global')
+            self.logger.info("Signal from '%s' (channel=%s) timezone=%s (configured=%s)",
+                             channel_name, event.chat_id, signal.get('timezone'), channel_tz or 'global')
             await self.signal_callback(signal)
 
     async def disconnect(self):

@@ -295,6 +295,16 @@ function tickCountdown() {
   }
 }
 
+// Entry shown in this browser's local time, with the signal's own clock after it.
+function queueEntryText(item) {
+  if (!item.entry_at) return item.entry_time || '';
+  const d = new Date(item.entry_at);
+  if (isNaN(d)) return item.entry_time || '';
+  const local = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  const src = (item.entry_time || '').replace(/:00$/, '');
+  return `${local} your time (signal ${src} ${item.signal_tz || ''}${item.tz_auto ? ', auto' : ''})`;
+}
+
 function renderQueue() {
   const box = $('queue');
   if (!box) return;
@@ -310,8 +320,9 @@ function renderQueue() {
         <div class="queue-badge ${isCall ? 'badge-call' : 'badge-put'}">
           ${isCall ? '▲ CALL' : '▼ PUT'}
         </div>
-        <div class="queue-time">${escHtml(item.expiry || '')} @ ${escHtml(item.entry_time || '')}</div>
+        <div class="queue-time">${escHtml(item.expiry || '')} @ ${escHtml(queueEntryText(item))}</div>
         <div class="queue-countdown">${fmtCountdown(item.seconds_left)}</div>
+        ${item.channel ? `<div class="text-dim" style="flex-basis:100%;font-size:11.5px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="Signal channel">From: ${escHtml(item.channel)}</div>` : ''}
       </div>
     `;
   }).join('');
@@ -529,7 +540,7 @@ function applyState(s) {
 
 async function fetchStatus() {
   try {
-    const s = await api('/api/status', 'GET');
+    const s = await api('/api/status?tzo=' + (-new Date().getTimezoneOffset()), 'GET');
     applyState(s);
   } catch (e) {
     console.error('Status fetch failed:', e);
@@ -722,6 +733,7 @@ async function loadSettings() {
 // Independent channel signal timezones. Blank inherits the global timezone.
 const CHANNEL_TIMEZONES = [
   ['', 'Use global timezone'],
+  ['AUTO', 'Auto-detect'],
   ...Array.from({length: 27}, (_, i) => i - 12).filter(h => h >= -12 && h <= 14).map(h => [`UTC${h >= 0 ? '+' : ''}${h}`, `UTC${h >= 0 ? '+' : ''}${h}`]),
   ['UTC+5:30', 'UTC+5:30'], ['UTC+5:45', 'UTC+5:45'], ['UTC+9:30', 'UTC+9:30'],
   ['Africa/Lagos', 'Lagos (WAT)'], ['Europe/London', 'London (automatic DST)'],

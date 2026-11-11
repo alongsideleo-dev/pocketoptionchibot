@@ -172,14 +172,18 @@ def _pending_signals(th) -> list:
     for sig in list(th.executor.pending_signals.values()):
         item = {
             "asset":        sig.get("asset"),
+            "channel":      sig.get("channel"),
             "direction":    sig.get("direction"),
             "expiry":       sig.get("expiry"),
             "entry_time":   sig.get("entry_time"),
+            "entry_at":     sig["entry_at"].strftime("%Y-%m-%dT%H:%M:%SZ") if sig.get("entry_at") is not None else None,
+            "signal_tz":    sig.get("timezone"),
+            "tz_auto":      bool(sig.get("tz_auto")),
             "seconds_left": None,
         }
         if sig.get("entry_time"):
             try:
-                left = th.executor._calc_wait(sig["entry_time"], sig.get("timezone"))
+                left = th.executor._calc_wait(sig["entry_time"], sig.get("timezone"), sig.get("entry_at"))
                 item["seconds_left"] = round(left, 1) if left is not None else None
             except Exception:
                 pass
@@ -328,6 +332,17 @@ def index():
 
 @app.route("/api/status")
 def api_status():
+    # The browser reports its UTC offset so log lines can show entry times in
+    # the viewer's local time. Display only; it never affects when trades fire.
+    tzo = request.args.get("tzo")
+    if tzo is not None:
+        try:
+            minutes = int(tzo)
+            if -840 <= minutes <= 840:
+                from bot import telegram_handler as _th
+                _th.DISPLAY_UTC_OFFSET_MIN = minutes
+        except Exception:
+            pass
     state = get_bot_state()
     state["connections"] = get_connection_status()
     return jsonify(state)

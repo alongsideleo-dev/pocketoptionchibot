@@ -27,6 +27,15 @@ try:
 except Exception:
     _PO_REGIONS = None
 
+try:
+    # The library refuses any pair missing from this built-in table (about 120
+    # names). Pocket Option's live catalogue is larger, so pairs the broker
+    # reports are added to it as they arrive. The table is only used as an
+    # allow-list; orders are sent by name.
+    from pocketoptionapi_async.constants import ASSETS as _PO_ASSETS
+except Exception:
+    _PO_ASSETS = None
+
 _LIB_LOG_BRIDGED = False
 # Live region that last authenticated. Module-level because the dashboard
 # creates a new PocketHandler for every Connect click.
@@ -299,6 +308,7 @@ class PocketHandler:
         try:
             if isinstance(data, list) and len(data) > 10 and isinstance(data[0], list):
                 count = 0
+                added = 0
                 for item in data:
                     if len(item) > 14:
                         sym = str(item[1])
@@ -315,8 +325,15 @@ class PocketHandler:
                         self.assets_info[clean.lower()] = info
                         self.assets_info[sym.lower()] = info
                         count += 1
+                        if _PO_ASSETS is not None and sym not in _PO_ASSETS:
+                            _PO_ASSETS[sym] = item[0]
+                            added += 1
+                        if _PO_ASSETS is not None and clean not in _PO_ASSETS:
+                            _PO_ASSETS[clean] = item[0]
                 open_cnt = sum(1 for a in self.assets_info.values() if a.get("is_open"))
                 self.logger.info(f"Loaded {count} Pocket Option assets ({open_cnt} open pairs).")
+                if added:
+                    self.logger.info("Enabled %d more Pocket Option pairs that the trading library did not list.", added)
             elif isinstance(data, dict) and "error" in data:
                 err = data.get("error")
                 asset = data.get("asset")
@@ -553,6 +570,11 @@ class PocketHandler:
 
         # Pre-check market open status
         is_open = self.is_asset_open(asset_name)
+        if is_open is None and self.assets_info:
+            self.logger.warning(
+                f"Trade SKIPPED: {asset_name} is not on Pocket Option's asset list (the signal may be for another broker)."
+            )
+            return False, None
         if is_open is False:
             self.logger.warning(
                 f"Trade SKIPPED: {asset_name} market is currently CLOSED on Pocket Option (IncorrectOpenTime)."
