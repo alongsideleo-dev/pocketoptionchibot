@@ -353,6 +353,7 @@ function renderLastTrade(t) {
         </span>
         ${resBadge}
       </div>
+      ${t.channel ? `<div class="text-dim" style="font-size:11.5px;margin:2px 0 4px;" title="Signal channel">From: ${escHtml(t.channel)}</div>` : ''}
       <div class="trade-details">
         <span>Amount: <b>${fmtMoney(t.amount)}</b></span>
         <span>Duration: <b>${t.duration || 60}s</b></span>

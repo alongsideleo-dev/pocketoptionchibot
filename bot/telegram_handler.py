@@ -369,7 +369,8 @@ class SignalExecutor:
 
             # Execute trade
             signal['executed'] = True
-            self.logger.info(f"Executing trade: {asset} {direction.upper()} expiry={expiry}")
+            self.logger.info(f"Executing trade: {asset} {direction.upper()} expiry={expiry}"
+                             + (f" | from: {signal['channel']}" if signal.get('channel') else ""))
             mg_times = [m['time'] for m in signal.get('martingale_steps', [])]
             await self.pocket_handler.perform_trade(
                 symbol=asset,
@@ -379,6 +380,7 @@ class SignalExecutor:
                 signal_martingale_steps=signal.get('max_martingale_steps'),
                 martingale_times=mg_times if mg_times else None,
                 timezone=signal.get('timezone'),
+                channel=signal.get('channel'),
             )
 
         except Exception as e:

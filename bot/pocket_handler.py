@@ -510,7 +510,7 @@ class PocketHandler:
     #  TRADE EXECUTION & SETTLEMENT
     # =========================================================================
 
-    async def _get_trade_result(self, order_id: Any, duration_secs: int):
+    async def _get_trade_result(self, order_id: Any, duration_secs: int, label: str = ""):
         """
         Uses check_win() to wait for trade completion message.
         Returns (won, profit): won is True/False/None.
@@ -525,7 +525,7 @@ class PocketHandler:
             profit = float(res.get("profit") or 0.0)
 
             won = True if result_str == "win" else False if result_str in ["loss", "lose"] else None
-            self.logger.info(f"Trade {order_id} result: {result_str} | profit=${profit:.2f}")
+            self.logger.info(f"Trade {order_id} result: {result_str} | profit=${profit:.2f}{label}")
             return won, profit
         except Exception as e:
             self.logger.error(f"Could not read trade result: {e}")
@@ -544,8 +544,8 @@ class PocketHandler:
             f"Stats: {self.wins}W / {self.losses}L | last trade profit: ${profit:.2f}"
         )
 
-    async def _settle_and_record(self, order_id: Any, duration_secs: int):
-        won, profit = await self._get_trade_result(order_id, duration_secs)
+    async def _settle_and_record(self, order_id: Any, duration_secs: int, label: str = ""):
+        won, profit = await self._get_trade_result(order_id, duration_secs, label)
         self._record_result(won, profit)
         await self._refresh_balance_stats()
 
@@ -562,17 +562,19 @@ class PocketHandler:
         expiry: Optional[str],
         wait_result: bool,
         step_label: str = "Base Trade",
+        channel: Optional[str] = None,
     ):
         """Places a single order on Pocket Option."""
+        src = f" | from: {channel}" if channel else ""
         self.logger.info(
-            f"Placing trade ({step_label}): {asset_name} {direction.upper()} ${amount:.2f} duration: {period_secs}s"
+            f"Placing trade ({step_label}): {asset_name} {direction.upper()} ${amount:.2f} duration: {period_secs}s{src}"
         )
 
         # Pre-check market open status
         is_open = self.is_asset_open(asset_name)
         if is_open is None and self.assets_info:
             self.logger.warning(
-                f"Trade SKIPPED: {asset_name} is not on Pocket Option's asset list (the signal may be for another broker)."
+                f"Trade SKIPPED: {asset_name} is not on Pocket Option's asset list (the signal may be for another broker).{src}"
             )
             return False, None
         if is_open is False:
@@ -690,11 +692,12 @@ class PocketHandler:
             "result":    None,
             "profit":    None,
             "step":      step_label,
+            "channel":   channel,
         }
 
         self.logger.info(
             f"Trade #{self.daily_trades} placed ({step_label}) - {asset_name} {direction.upper()} "
-            f"${amount:.2f} | order_id={order_id} | latency={latency:.2f}s | Daily: {self.daily_trades}/{self.config.trading.max_daily_trades}"
+            f"${amount:.2f} | order_id={order_id} | latency={latency:.2f}s | Daily: {self.daily_trades}/{self.config.trading.max_daily_trades}{src}"
         )
 
         trade_log_msg = {
@@ -704,6 +707,7 @@ class PocketHandler:
             'expiry': expiry,
             'order_id': str(order_id),
             'step': step_label,
+            'channel': channel,
         }
         logging.getLogger('trades').info(f"POCKET_OPTION_TRADE_EXECUTED | {json.dumps(trade_log_msg)}")
 
@@ -711,12 +715,12 @@ class PocketHandler:
             return True, None
 
         if wait_result:
-            won, profit = await self._get_trade_result(order_id, period_secs)
+            won, profit = await self._get_trade_result(order_id, period_secs, f" | {asset_name}{src}")
             self._record_result(won, profit)
             await self._refresh_balance_stats()
             return True, won
 
-        asyncio.ensure_future(self._settle_and_record(order_id, period_secs))
+        asyncio.ensure_future(self._settle_and_record(order_id, period_secs, f" | {asset_name}{src}"))
         return True, None
 
     # =========================================================================
@@ -732,6 +736,7 @@ class PocketHandler:
         signal_martingale_steps: Optional[int] = None,
         martingale_times: Optional[List[str]] = None,
         timezone: Optional[str] = None,
+        channel: Optional[str] = None,
     ) -> bool:
         if not self._driver_alive():
             self.logger.error("PocketHandler not authenticated/connected; refusing to place a trade.")
@@ -789,7 +794,7 @@ class PocketHandler:
             if not use_martingale:
                 placed, _ = await self._place_one(
                     asset_name, direction, period_secs, base_amount, expiry,
-                    wait_result=True, step_label="Base Trade",
+                    wait_result=True, step_label="Base Trade", channel=channel,
                 )
                 return placed
 
@@ -811,7 +816,7 @@ class PocketHandler:
             # Step 0: Place Base Trade
             placed, won = await self._place_one(
                 asset_name, direction, period_secs, base_amount, expiry,
-                wait_result=True, step_label="Base Trade",
+                wait_result=True, step_label="Base Trade", channel=channel,
             )
             if not placed:
                 return False
@@ -881,7 +886,7 @@ class PocketHandler:
 
                 placed, won = await self._place_one(
                     asset_name, direction, period_secs, current_amount, expiry,
-                    wait_result=True, step_label=step_name,
+                    wait_result=True, step_label=step_name, channel=channel,
                 )
                 if not placed:
                     self.logger.warning(f"Could not place {step_name} order. Sequence stopped.")
